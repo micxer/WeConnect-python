@@ -1,10 +1,11 @@
+import base64
+import hashlib
 import json
 import logging
+import secrets
 import requests
 
-from urllib.parse import parse_qsl, urlparse
-
-from oauthlib.common import add_params_to_uri, generate_nonce, to_unicode
+from oauthlib.common import to_unicode
 from oauthlib.oauth2 import InsecureTransportError
 from oauthlib.oauth2 import is_secure_transport
 
@@ -21,12 +22,15 @@ LOG = logging.getLogger("weconnect")
 class WeConnectSession(VWWebSession):
     def __init__(self, sessionuser, **kwargs):
         super(WeConnectSession, self).__init__(client_id='a24fba63-34b3-4d43-b181-942111e6bda8@apps_vw-dilab_com',
-                                               refresh_url='https://identity.vwgroup.io/oidc/v1/token',
-                                               scope='openid profile badge cars dealers vin',
+                                               refresh_url='https://emea.bff.cariad.digital/auth/v1/idk/oidc/token',
+                                               scope='openid profile badge cars vin',
                                                redirect_uri='weconnect://authenticated',
                                                state=None,
                                                sessionuser=sessionuser,
                                                **kwargs)
+
+        # PKCE code verifier, generated per authorization request (see authorizationUrl)
+        self.codeVerifier = None
 
         self.headers = CaseInsensitiveDict({
             'accept': '*/*',
@@ -68,32 +72,28 @@ class WeConnectSession(VWWebSession):
         super(WeConnectSession, self).login()
         authorizationUrl = self.authorizationUrl(url='https://identity.vwgroup.io/oidc/v1/authorize')
         response = self.doWebAuth(authorizationUrl)
-        self.fetchTokens('https://emea.bff.cariad.digital/user-login/login/v1',
+        self.fetchTokens('https://emea.bff.cariad.digital/auth/v1/idk/oidc/token',
                          authorization_response=response
                          )
 
     def refresh(self):
         self.refreshTokens(
-            'https://emea.bff.cariad.digital/login/v1/idk/token',
+            'https://emea.bff.cariad.digital/auth/v1/idk/oidc/token',
         )
 
     def authorizationUrl(self, url, state=None, **kwargs):
-        if state is not None:
-            raise AuthentificationError('Do not provide state')
+        # The WeConnect SSO endpoints (/user-login/v1/authorize and
+        # /user-login/login/v1) no longer work. Authenticate directly against the
+        # OIDC authorize endpoint using the standard authorization_code + PKCE flow
+        # and exchange the code at the cariad BFF OIDC token endpoint.
+        self.codeVerifier = secrets.token_urlsafe(64)
+        codeChallenge = base64.urlsafe_b64encode(
+            hashlib.sha256(self.codeVerifier.encode('ascii')).digest()
+        ).decode('ascii').rstrip('=')
 
-        params = [(('redirect_uri', self.redirect_uri)),
-                  (('nonce', generate_nonce()))]
-
-        authUrl = add_params_to_uri('https://emea.bff.cariad.digital/user-login/v1/authorize', params)
-
-        tryLoginResponse: requests.Response = self.get(authUrl, allow_redirects=False, access_type=AccessType.NONE)
-        redirect = tryLoginResponse.headers['Location']
-        query = urlparse(redirect).query
-        params = dict(parse_qsl(query))
-        if 'state' in params:
-            self.state = params.get('state')
-
-        return redirect
+        return super(WeConnectSession, self).authorizationUrl(
+            url, state=state, code_challenge=codeChallenge, code_challenge_method='S256', **kwargs
+        )
 
     def clearTokens(self) -> None:
         """
@@ -114,21 +114,22 @@ class WeConnectSession(VWWebSession):
     ):
         self.parseFromFragment(authorization_response)
 
-        if all(key in self.token for key in ('state', 'id_token', 'access_token', 'code')):
-            body: str = json.dumps(
-                {
-                    'state': self.token['state'],
-                    'id_token': self.token['id_token'],
-                    'redirect_uri': self.redirect_uri,
-                    'region': 'emea',
-                    'access_token': self.token['access_token'],
-                    'authorizationCode': self.token['code'],
-                })
+        if 'code' in self.token:
+            # Exchange the authorization code for tokens at the OIDC token endpoint
+            # using the standard authorization_code grant with the PKCE code verifier.
+            body = {
+                'grant_type': 'authorization_code',
+                'code': self.token['code'],
+                'code_verifier': self.codeVerifier,
+                'redirect_uri': self.redirect_uri,
+                'client_id': self.client_id,
+            }
 
             loginHeadersForm: CaseInsensitiveDict = self.headers
             loginHeadersForm['accept'] = 'application/json'
+            loginHeadersForm['content-type'] = 'application/x-www-form-urlencoded'
 
-            tokenResponse = self.post(token_url, headers=loginHeadersForm, data=body, allow_redirects=False, access_type=AccessType.ID)
+            tokenResponse = self.post(token_url, headers=loginHeadersForm, data=body, allow_redirects=False, access_type=AccessType.NONE)
             if tokenResponse.status_code != requests.codes['ok']:
                 raise TemporaryAuthentificationError(f'Token could not be fetched due to temporary WeConnect failure: {tokenResponse.status_code}')
             token = self.parseFromBody(tokenResponse.text)
@@ -146,7 +147,7 @@ class WeConnectSession(VWWebSession):
 
             return token
         else:
-            LOG.error("Authorization response missing required tokens")
+            LOG.error("Authorization response missing authorization code")
             return None
 
     def parseFromBody(self, token_response, state=None):
